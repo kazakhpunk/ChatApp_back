@@ -1,67 +1,120 @@
-import "dotenv/config";
-import express from "express";
-import { Server } from "socket.io";
-import { createServer } from "node:http";
-import { chatModel } from "./chat/models/chat";
-import mongoose from "mongoose";
-import { messageModel } from "./chat/models/message";
-import connectDB from "./db";
-import User from "./auth/models/User";
+import express from 'express';
+import http from 'http';
+import { Server } from 'socket.io';
+import mongoose, { Schema, Document } from 'mongoose';
+import dotenv from 'dotenv';
+import cors from 'cors';
+
+dotenv.config();
 
 const app = express();
-const server = createServer(app);
-const io = new Server(server);
-
-connectDB();
-
-app.get("/send-notification-to-users", (req, res) => {
-  // get from params room name
-  const room = req.query.room as string;
-  io.to("room-1").to("room-2").emit("hello", "world");
-  res.send("Hello World");
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: 'http://localhost:3000',
+    methods: ['GET', 'POST']
+  }
 });
 
-app.get("/test-chat-creation", async (req, res) => {
-  const message = await messageModel.create({
-    text: "message1",
-    sender: new mongoose.Types.ObjectId("6668070f88dbf6aed3a00216"),
-    chat: new mongoose.Types.ObjectId("6668070f88dbf6aed3a00216"),
+if (!process.env.MONGO_URI) {
+  throw new Error("MONGO_URI is not defined in the environment variables");
+}
+
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log('Connected to MongoDB'))
+  .catch(err => console.error('Failed to connect to MongoDB', err));
+
+interface IUser extends Document {
+  username: string;
+  password: string;
+  online: boolean;
+}
+
+interface IMessage extends Document {
+  sender: string;
+  receiver: string;
+  message: string;
+  timestamp: string;
+}
+
+const userSchema: Schema = new Schema({
+  username: { type: String, required: true, unique: true },
+  password: { type: String, required: true },
+  online: { type: Boolean, default: false },
+});
+
+const messageSchema: Schema = new Schema({
+  sender: { type: String, required: true },
+  receiver: { type: String, required: true },
+  message: { type: String, required: true },
+  timestamp: { type: String, required: true },
+});
+
+const User = mongoose.model<IUser>('User', userSchema);
+const Message = mongoose.model<IMessage>('Message', messageSchema);
+
+app.use(cors()); // Enable CORS
+app.use(express.json());
+
+app.post('/login', async (req, res) => {
+  const { username, password } = req.body;
+  const user = await User.findOne({ username, password });
+  if (user) {
+    res.sendStatus(200);
+  } else {
+    res.sendStatus(401);
+  }
+});
+
+app.post('/register', async (req, res) => {
+  const { username, password } = req.body;
+  try {
+    const newUser = new User({ username, password, online: false });
+    await newUser.save();
+    res.sendStatus(201);
+  } catch (error) {
+    res.status(400).send(error);
+  }
+});
+
+app.get('/users', async (req, res) => {
+  const users = await User.find();
+  res.json(users);
+});
+
+app.get('/messages', async (req, res) => {
+  const messages = await Message.find();
+  res.json(messages);
+});
+
+io.on('connection', (socket) => {
+  console.log('a user connected');
+
+  socket.on('join', async (username) => {
+    socket.data.username = username;
+    await User.findOneAndUpdate({ username }, { online: true });
+    io.emit('userOnline', username);
   });
 
-  await chatModel.create({
-    participants: [
-      new mongoose.Types.ObjectId("6668070f88dbf6aed3a00216"),
-      new mongoose.Types.ObjectId("6668070f88dbf6aed3a00216"),
-    ],
-    lastMessage: message.id,
+  socket.on('message', async (msg) => {
+    const message = new Message(msg);
+    await message.save();
+    io.emit('message', msg);
   });
 
-  res.send("Chat created");
-});
+  socket.on('typing', (data) => {
+    socket.broadcast.emit('typing', data);
+  });
 
-app.get("/api/chats/:id", async (req, res) => {
-  await User.countDocuments();
-
-  const chatID = req.params.id;
-  const chat = await chatModel
-    .findById(chatID)
-    .populate("participants")
-    .populate("lastMessage");
-
-  const messages = await messageModel.find({ chat: chat!.id });
-
-  res.json({ chat, messages });
-});
-
-io.on("connection", (socket) => {
-  console.log("a user connected");
-
-  socket.on("join-room", (room) => {
-    console.log("joined room", room);
-    socket.join(room);
+  socket.on('disconnect', async () => {
+    const username = socket.data.username;
+    if (username) {
+      await User.findOneAndUpdate({ username }, { online: false });
+      io.emit('userOffline', username);
+    }
   });
 });
 
-server.listen(3000, () => {
-  console.log("server running at http://localhost:3000");
+server.listen(8000, () => {
+  console.log('listening on *:8000');
 });
